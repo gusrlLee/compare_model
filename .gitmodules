@@ -1,0 +1,9 @@
+[submodule "third_party/etcpak"]
+	path = third_party/etcpak
+	url = https://github.com/wolfpld/etcpak.git
+[submodule "third_party/nvpro_core"]
+	path = third_party/nvpro_core
+	url = https://github.com/nvpro-samples/nvpro_core.git
+[submodule "third_party/nvpro_core2"]
+	path = third_party/nvpro_core2
+	url = https://github.com/nvpro-samples/nvpro_core2
