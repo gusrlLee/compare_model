@@ -30,19 +30,17 @@ char Lowercase(unsigned char c)
 int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::path &output_path,
                 ID3D11Device* device)
 {
-    // Metadata describes the layout and format; source owns the compressed bytes.
-    // Loading must finish before the decode timer starts to exclude disk access.
-    DirectX::TexMetadata meta_data{};
+    // 1. Load and validate the input. File I/O is outside all processing timers.
+    // source owns the compressed pixels; metadata describes their layout.
+    DirectX::TexMetadata metadata{};
     DirectX::ScratchImage source;
 
-    // Load the DDS before timing so disk I/O is excluded.
     const HRESULT hr = DirectX::LoadFromDDSFile(
         input_path.c_str(),
         DirectX::DDS_FLAGS_NONE,
-        &meta_data,
+        &metadata,
         source);
 
-    // HRESULT encodes success/failure. Do not use a partially loaded ScratchImage.
     if (FAILED(hr))
     {
         std::cerr << "DDS load failed: 0x" << std::hex << static_cast<unsigned long>(hr) << '\n';
@@ -50,53 +48,52 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
     }
 
     // This benchmark accepts one BC-compressed 2D texture with only Mip 0.
-    if (!DirectX::IsCompressed(meta_data.format))
+    if (!DirectX::IsCompressed(metadata.format))
     {
-        std::cerr << "Input must be BC compressed" << std::endl;
+        std::cerr << "Input must be BC compressed" << '\n';
         return 1;
     }
 
-    if (meta_data.mipLevels != 1)
+    if (metadata.mipLevels != 1)
     {
-        std::cerr << "Input must contain only Mip 0." << std::endl;
+        std::cerr << "Input must contain only Mip 0." << '\n';
         return 1;
     }
 
     // Reject unsupported GPU formats instead of silently falling back to the CPU.
-    if (device && meta_data.format != DXGI_FORMAT_BC6H_UF16
-        && meta_data.format != DXGI_FORMAT_BC6H_SF16
-        && meta_data.format != DXGI_FORMAT_BC7_UNORM
-        && meta_data.format != DXGI_FORMAT_BC7_UNORM_SRGB)
+    if (device && metadata.format != DXGI_FORMAT_BC6H_UF16
+        && metadata.format != DXGI_FORMAT_BC6H_SF16
+        && metadata.format != DXGI_FORMAT_BC7_UNORM
+        && metadata.format != DXGI_FORMAT_BC7_UNORM_SRGB)
     {
         std::cerr << "GPU compression requires BC6H or BC7.\n";
         return 1;
     }
 
-    if (meta_data.dimension != DirectX::TEX_DIMENSION_TEXTURE2D || meta_data.arraySize != 1)
+    if (metadata.dimension != DirectX::TEX_DIMENSION_TEXTURE2D || metadata.arraySize != 1)
     {
         std::cerr << "Input must be a single 2D texture.\n";
         return 1;
     }
 
-    // Decode on the CPU; UNKNOWN lets DirectXTex choose the output pixel format.
-    // UNKNOWN requests the library's default decoded format for the source codec.
-    // This lets HDR BC6H use an appropriate representation rather than forcing RGBA8.
-    // Decompression is a CPU operation even when GPU compression is selected.
+    // 2. Decompress on the CPU, including when GPU compression is selected.
+    // UNKNOWN lets DirectXTex choose the decoded format, including HDR for BC6H.
     DirectX::ScratchImage decompressed;
     const auto decompress_start = GetTime();
-    const HRESULT decompress_hr = DirectX::Decompress(source.GetImages(), source.GetImageCount(), source.GetMetadata(), DXGI_FORMAT_UNKNOWN, decompressed);
+    const HRESULT decompress_hr = DirectX::Decompress(
+        source.GetImages(), source.GetImageCount(), source.GetMetadata(),
+        DXGI_FORMAT_UNKNOWN, decompressed);
     const double decompress_ms = (GetTime() - decompress_start) / 1000.0;
 
     if (FAILED(decompress_hr))
     {
-        std::cerr << "Decompress failed: 0x" << std::hex << static_cast<unsigned long>(decompress_hr) << std::endl;
+        std::cerr << "Decompress failed: 0x" << std::hex << static_cast<unsigned long>(decompress_hr) << '\n';
         return 1;
     }
 
-    // Generate the full mip chain on the CPU using the Box filter (0 = all levels).
-    // The generated chain includes an uncompressed copy of Mip 0 plus lower levels.
-    // Keep decompressed alive while the library reads it; mip_chain owns its output.
-    // Box selects the filter. Color-space handling is left to DirectXTex's flags/format.
+    // 3. Generate the full Box mip chain on the CPU (0 requests all levels).
+    // mip_chain owns the decoded Mip 0 and every lower mip.
+    // Color-space handling is left to DirectXTex's flags and decoded format.
     DirectX::ScratchImage mip_chain;
     const auto downsample_start = GetTime();
     const HRESULT mip_hr = DirectX::GenerateMipMaps(
@@ -111,29 +108,29 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
         return 1;
     }
 
-    std::cout << "Mip levels: " << mip_chain.GetMetadata().mipLevels << '\n';
-
+    // 4. Compress only the lower mips. Keep the original compressed Mip 0.
     DirectX::ScratchImage compressed;
-    auto lower_meta = mip_chain.GetMetadata();
+    auto lower_metadata = mip_chain.GetMetadata();
 
     // A 1x1 input has no lower mip levels, so its compression time stays zero.
     double compress_ms = 0.0;
 
-    if (lower_meta.mipLevels > 1)
+    if (lower_metadata.mipLevels > 1)
     {
         // Skip Mip 0 and describe Mip 1 as the base of the chain to compress.
-        // Image pointer arithmetic advances by one image descriptor, not one pixel.
-        // Passing the original full-size metadata here would describe the wrong chain.
-        const DirectX::Image *first = mip_chain.GetImages() + 1;
-        lower_meta.width = first->width;
-        lower_meta.height = first->height;
-        --lower_meta.mipLevels;
+        // Advance by one Image descriptor, then match metadata to the smaller base.
+        const DirectX::Image *first_lower_mip = mip_chain.GetImages() + 1;
+        lower_metadata.width = first_lower_mip->width;
+        lower_metadata.height = first_lower_mip->height;
+        --lower_metadata.mipLevels;
 
         // Use the library's CPU parallel implementation instead of adding file workers.
         // GPU compression uses the separate D3D11 overload and its own default flags.
-        DirectX::TEX_COMPRESS_FLAGS flags = device ? DirectX::TEX_COMPRESS_DEFAULT : DirectX::TEX_COMPRESS_PARALLEL;
+        DirectX::TEX_COMPRESS_FLAGS flags = DirectX::TEX_COMPRESS_DEFAULT;
+        if (!device)
+            flags |= DirectX::TEX_COMPRESS_PARALLEL;
 
-        if (meta_data.format == DXGI_FORMAT_BC7_UNORM || meta_data.format == DXGI_FORMAT_BC7_UNORM_SRGB)
+        if (metadata.format == DXGI_FORMAT_BC7_UNORM || metadata.format == DXGI_FORMAT_BC7_UNORM_SRGB)
         {
             // BC7 QUICK reduces the encoder search for speed. It changes the quality
             // tradeoff, so do not treat this as equal quality to another library's default.
@@ -143,20 +140,19 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
         // Time the whole API call, including GPU transfers when using a device.
         const auto compress_start = GetTime();
         HRESULT compress_hr;
-        if (device) // gpu 
+        if (device)
         {
             compress_hr = DirectX::Compress(
-                device, first, lower_meta.mipLevels, lower_meta,
-                meta_data.format, flags,
+                device, first_lower_mip, lower_metadata.mipLevels, lower_metadata,
+                metadata.format, flags,
                 DirectX::TEX_ALPHA_WEIGHT_DEFAULT, compressed);
         }
-        else // cpu
+        else
         {
             compress_hr = DirectX::Compress(
-                first, lower_meta.mipLevels, lower_meta,
-                meta_data.format,
-                flags, DirectX::TEX_THRESHOLD_DEFAULT,
-                compressed);
+                first_lower_mip, lower_metadata.mipLevels, lower_metadata,
+                metadata.format, flags,
+                DirectX::TEX_THRESHOLD_DEFAULT, compressed);
         }
         compress_ms = (GetTime() - compress_start) / 1000.0;
         if (FAILED(compress_hr))
@@ -166,39 +162,37 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
         }
     }
 
-    // Keep the original compressed Mip 0 and append the newly compressed levels.
-    // These Image objects borrow pixels owned by source and compressed above.
+    // 5. Assemble the output: original Mip 0 followed by newly compressed mips.
     // Image is a view: copying it copies pointers and pitches, not the pixel storage.
     // source and compressed must outlive this list and any future SaveToDDSFile call.
     std::vector<DirectX::Image> images{source.GetImages()[0]};
     if (compressed.GetImageCount() > 0)
     {
-        images.insert(images.end(), compressed.GetImages(), compressed.GetImages() + compressed.GetImageCount());
+        images.insert(images.end(), compressed.GetImages(),
+                      compressed.GetImages() + compressed.GetImageCount());
     }
 
-    // Prepare the output metadata; DDS saving is currently disabled below.
-    auto output_meta = meta_data;
-    output_meta.mipLevels = images.size();
+    auto output_metadata = metadata;
+    output_metadata.mipLevels = images.size();
 
-    // Saving would be outside all timers. Keep the existing disabled-save behavior
-    // while reviewing the benchmark; output_path currently produces no DDS file.
-    // const HRESULT save_hr = DirectX::SaveToDDSFile(
-    //     images.data(), images.size(), output_meta,
-    //     DirectX::DDS_FLAGS_FORCE_DX10_EXT, output_path.c_str());
+    const HRESULT save_hr = DirectX::SaveToDDSFile(
+        images.data(), images.size(), output_metadata,
+        DirectX::DDS_FLAGS_FORCE_DX10_EXT, output_path.c_str());
 
-    // if (FAILED(save_hr))
-    // {
-    //     std::cerr << "Save failed: 0x" << std::hex << static_cast<unsigned long>(save_hr) << '\n';
-    //     return 1;
-    // }
+    if (FAILED(save_hr))
+    {
+        std::cerr << "Save failed: 0x" << std::hex << static_cast<unsigned long>(save_hr) << '\n';
+        return 1;
+    }
 
-    // GetTime returns microseconds; each timed difference above is converted to ms.
-    // Sum only the three processing calls, excluding file I/O and setup.
-    std::cout << "Compression backend: " << (device ? "GPU" : "CPU OpenMP") << '\n'
+    // 6. Report the sum of the three processing calls, not total program runtime.
+    // GetTime returns microseconds, so divide each elapsed time by 1000 for ms.
+    std::cout << "Mip levels: " << mip_chain.GetMetadata().mipLevels << '\n'
+              << "Compression backend: " << (device ? "GPU" : "CPU OpenMP") << '\n'
               << "Decompress: " << decompress_ms << " ms\n"
               << "Downsampling: " << downsample_ms << " ms\n"
               << "Compression: " << compress_ms << " ms\n"
-              << "Total generation time : " << decompress_ms + downsample_ms + compress_ms << " ms" << std::endl;
+              << "Total generation time : " << decompress_ms + downsample_ms + compress_ms << " ms" << '\n';
     return 0;
 }
 
@@ -209,7 +203,7 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
 int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::path &output,
                  ID3D11Device* device)
 {
-    // Collect DDS files in this folder only; report filesystem errors without exceptions.
+    // Collect first, then process. Keep directory traversal out of the image pipeline.
     std::error_code error;
     std::vector<std::filesystem::path> files;
     std::filesystem::directory_iterator entry(folder, error), end;
@@ -234,7 +228,6 @@ int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::pat
         std::cerr << "No DDS files found.\n";
         return 1;
     }
-    // Use the same file order on each run.
     std::sort(files.begin(), files.end());
 
     std::filesystem::create_directories(output, error);
@@ -244,7 +237,6 @@ int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::pat
         return 1;
     }
 
-    // Process files sequentially; a failed file does not stop the remaining files.
     size_t succeeded = 0;
     for (const auto &file : files)
     {
@@ -283,7 +275,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // WIC-based mip generation needs COM; this flag does not parallelize the benchmark.
+    // 1. Initialize COM once for library paths that use WIC.
+    // COINIT_MULTITHREADED is an apartment setting, not a worker-thread count.
     const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(com_hr))
     {
@@ -292,16 +285,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // Balance COM initialization on every return path.
-    // A stack destructor balances CoInitializeEx even when a later error returns early.
-    // COINIT_MULTITHREADED is a COM apartment setting, not a worker-thread count.
+    // Balance CoInitializeEx even when a later error returns early.
     struct ComCleanup
     {
         ~ComCleanup() { CoUninitialize(); }
     } com_cleanup;
 
-
-    // Create one hardware device for the whole run, outside the measured calls.
+    // 2. Create a shared GPU device only when --gpu is requested.
+    // Device creation happens outside the measured calls.
     // ComPtr releases the device automatically when main returns.
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     if (argc == 4)
@@ -318,6 +309,7 @@ int main(int argc, char **argv)
         }
     }
 
+    // 3. Route a wildcard or folder to batch mode; otherwise process one file.
     const std::filesystem::path input(argv[1]);
     const std::filesystem::path output(argv[2]);
     // Handle the supported wildcard explicitly; no general glob matching is used.
