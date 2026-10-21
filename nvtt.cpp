@@ -56,7 +56,7 @@ bool ReadDDS(const std::filesystem::path &path, DDSImage &image)
         // BC1a allows the encoder to represent BC1 one-bit transparency.
         switch (header[32])
         {
-        case 71: case 72: image.format = nvtt::Format_BC1a; break;
+        case 71: case 72: image.format = nvtt::Format_BC1; break;
         case 74: case 75: image.format = nvtt::Format_BC2; break;
         case 77: case 78: image.format = nvtt::Format_BC3; break;
         case 80: image.format = nvtt::Format_BC4; break;
@@ -92,8 +92,12 @@ bool ReadDDS(const std::filesystem::path &path, DDSImage &image)
         return false;
     image.width = static_cast<int>(width);
     image.height = static_cast<int>(height);
-    const bool eight_bytes = image.format == nvtt::Format_BC1a
-        || image.format == nvtt::Format_BC4 || image.format == nvtt::Format_BC4S;
+
+    const bool eight_bytes = image.format == nvtt::Format_BC1a 
+        || image.format == nvtt::Format_BC1
+        || image.format == nvtt::Format_BC4 
+        || image.format == nvtt::Format_BC4S;
+    
     const size_t size = ((width + 3) / 4) * ((height + 3) / 4) * (eight_bytes ? 8 : 16);
     std::error_code error;
     const auto file_size = std::filesystem::file_size(path, error);
@@ -181,6 +185,7 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
         std::cerr << "Input must be a typed BC1-BC7 single 2D DDS with only Mip 0.\n";
         return 1;
     }
+    
     // shortcut: reject signed BC4/BC5 until a newer SDK preserves negative values.
     if (source.format == nvtt::Format_BC4S || source.format == nvtt::Format_BC5S)
     {
@@ -191,11 +196,14 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
     // Keep both paths: NVTT CPU decoding, or CUDA texture hardware decoding.
     // GPU decode uploads compressed blocks and leaves float pixels resident on the GPU.
     const bool gpu = context.isCudaAccelerationEnabled();
+    
     nvtt::Surface image;
     const auto decode_start = GetTime();
+    
     const bool decoded = gpu
         ? DecompressGpu(source.format, source.width, source.height, source.blocks.data(), image)
         : image.setImage2D(source.format, source.width, source.height, source.blocks.data());
+    
     const double decode_ms = (GetTime() - decode_start) / 1000.0;
     if (!decoded)
     {
@@ -206,11 +214,14 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
     nvtt::CompressionOptions compression;
     compression.setFormat(source.format);
     compression.setQuality(quality);
+    
     // Match the sample's numeric interpretation for HDR encoders.
     if (source.format == nvtt::Format_BC6U)
         compression.setPixelType(nvtt::PixelType_UnsignedFloat);
+    
     else if (source.format == nvtt::Format_BC6S)
         compression.setPixelType(nvtt::PixelType_Float);
+    
     // countMipmaps includes Mip 0. estimateSize covers all compressed level payloads;
     // add the 148-byte DDS10 header separately when reserving output storage.
     const int levels = image.countMipmaps();
@@ -220,8 +231,10 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
         std::cerr << "Invalid estimated output size.\n";
         return 1;
     }
+    
     MemoryOutput memory;
     memory.bytes.reserve(148 + static_cast<size_t>(size));
+    
     nvtt::OutputOptions options;
     options.setContainer(nvtt::Container_DDS10);
     options.setSrgbFlag(source.srgb);
@@ -258,6 +271,7 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
         // Keep the working mip linear; only the encoder input returns to sRGB.
         const auto mip_start = GetTime();
         const bool downsampled = image.buildNextMipmap(nvtt::MipmapFilter_Box);
+    
         nvtt::Surface encodeImage = source.srgb ? image.clone() : image;
         if (source.srgb)
             encodeImage.toSrgb();
@@ -267,6 +281,7 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
             std::cerr << "NVTT downsampling failed at mip " << mip << '\n';
             return 1;
         }
+    
         const auto encode_start = GetTime();
         // Face 0 is the single 2D image; mip identifies this level in the output stream.
         // Compression includes the callback copies and any library-internal transfers.
@@ -305,6 +320,7 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
         std::cerr << "DDS save failed: " << output << '\n';
         return 1;
     }
+    
     if (total)
     {
         total->decompress = decode_ms;
@@ -312,6 +328,7 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
         total->compress = encode_ms;
         total->pipeline = pipeline_ms;
     }
+    
     return 0;
 }
 
@@ -422,11 +439,13 @@ int main(int argc, char** argv)
     bool gpu = argc > 3 && std::strcmp(argv[argc - 1], "--gpu") == 0;
     if (gpu)
         --argc;
+    
     if (argc != 3 && argc != 4)
     {
         std::cerr << "Usage: nvtt <input.dds|folder|folder/*.dds> <output.dds|folder> [fastest|normal|production|highest] [--gpu]\n";
         return 1;
     }
+    
     nvtt::Quality quality = nvtt::Quality_Normal;
     if (argc == 4)
     {
@@ -440,6 +459,7 @@ int main(int argc, char** argv)
             return 1;
         }
     }
+    
     // Reuse the library's own context and threading; initialize CUDA outside the timers.
     nvtt::Context context(gpu);
     if (gpu && !context.isCudaAccelerationEnabled())
@@ -447,6 +467,7 @@ int main(int argc, char** argv)
         std::cerr << "CUDA acceleration is unavailable.\n";
         return 1;
     }
+    
     if (gpu)
     {
         // Resolve the delayed driver import and initialize it outside image timers.
@@ -457,9 +478,11 @@ int main(int argc, char** argv)
             return 1;
         }
     }
+    
     const std::filesystem::path input(argv[1]), output(argv[2]);
     if (input.filename() == "*.dds")
         return ProcessBatch(input.has_parent_path() ? input.parent_path() : ".", output, context, quality);
+    
     // The error_code overload reports filesystem errors without a try/catch block.
     // An ordinary file goes to ProcessFile; a directory goes to ProcessBatch.
     std::error_code error;
@@ -469,13 +492,16 @@ int main(int argc, char** argv)
         std::cerr << "Cannot access input: " << error.message() << '\n';
         return 1;
     }
+    
     if (directory)
         return ProcessBatch(input, output, context, quality);
     if (!CanWrite(output))
         return 1;
     if (ProcessFile(input, output, context, quality, nullptr, true) != 0)
         return 1;
+    
     std::cout << "Warm-up completed (excluded from averages).\n";
+    
     std::ofstream csv;
     auto csv_path = output;
     csv_path.replace_extension(".timings.csv");

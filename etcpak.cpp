@@ -106,7 +106,6 @@ static bool ProcessDdsFile(const fs::path& input, const fs::path& output, DdsBen
             return false;
         }
 
-
         result.decompress = decompressEnd - decompressStart;
         const auto size = decoded->Size();
 
@@ -116,8 +115,10 @@ static bool ProcessDdsFile(const fs::path& input, const fs::path& output, DdsBen
         }
 
         const bool rgba = codec == CodecType::Bc3 || codec == CodecType::Bc7;
+
         // Make room for all mip levels in the chosen output codec.
         auto compressed = std::make_shared<BlockData>( size, true, codec );
+
         // Preserve the exact original blocks instead of encoding Mip 0 again.
         // This copy is outside the processing timer.
         const size_t baseBlocks = size_t( size.x / 4 ) * ( size.y / 4 );
@@ -189,8 +190,7 @@ static bool ProcessDdsFile(const fs::path& input, const fs::path& output, DdsBen
     return true;
 }
 
-static bool RunDdsMipmapBenchmark(
-    const fs::path& input, const fs::path& outputDir, CodecType codec, bool linearize )
+static bool RunDdsMipmapBenchmark(const fs::path& input, const fs::path& outputDir, CodecType codec, bool linearize )
 {
     if( !fs::is_directory( outputDir ) )
     {
@@ -225,19 +225,20 @@ static bool RunDdsMipmapBenchmark(
     }
 
     std::sort( files.begin(), files.end() );
+
     const auto cpus = System::CPUCores();
     TaskDispatch taskDispatch( cpus );
 
     // Use the same thread pool for the whole batch.
     std::ofstream csv(outputDir / "timings.csv");
     csv.imbue(std::locale::classic());
-    csv << std::fixed << std::setprecision(6)
-        << "file name,decompression time,downsampling + compression time,total generation time\n";
+    csv << std::fixed << std::setprecision(6) << "file name,decompression time,downsampling + compression time,total generation time\n";
     if (!csv)
     {
         fprintf(stderr, "Cannot create CSV.\n");
         return false;
     }
+
     DdsBenchmarkResult total;
     size_t succeeded = 0;
     bool warmedUp = false;
@@ -255,12 +256,14 @@ static bool RunDdsMipmapBenchmark(
         auto filename = file.filename();
         filename.replace_extension( ".dds" );
         const auto output = outputDir / filename;
+
         // Do not replace the input file with its own result.
         if( fs::exists( output ) && fs::equivalent( file, output ) )
         {
             fprintf( stderr, "Output must differ from input: %s\n", file.string().c_str() );
             continue;
         }
+
         if( !warmedUp )
         {
             DdsBenchmarkResult warmupResult;
@@ -269,6 +272,7 @@ static bool RunDdsMipmapBenchmark(
             warmedUp = true;
             printf( "Warm-up completed (excluded from averages).\n" );
         }
+        
         if( !ProcessDdsFile( file, output, result, cpus, codec, linearize ) )
         {
             continue;
@@ -303,12 +307,12 @@ static bool RunDdsMipmapBenchmark(
     return succeeded == files.size();
 }
 
-// Only the DDS mipmap experiment remains; no separate mode flag is needed.
 int main( int argc, char** argv )
 {
     auto codec = CodecType::Bc7;
     bool linearize = true;
     int argument = 1;
+
     while( argument < argc )
     {
         if( strcmp( argv[argument], "--linear" ) == 0 )
