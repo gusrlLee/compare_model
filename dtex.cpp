@@ -205,7 +205,6 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
 
     // 5. Assemble the output: original Mip 0 followed by newly compressed mips.
     // Image is a view: copying it copies pointers and pitches, not the pixel storage.
-    // source and compressed must outlive this list and any future SaveToDDSFile call.
     std::vector<DirectX::Image> images{source.GetImages()[0]};
     if (compressed.GetImageCount() > 0)
     {
@@ -220,7 +219,7 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
 
     const HRESULT save_hr = DirectX::SaveToDDSFile(
         images.data(), images.size(), output_metadata,
-        DirectX::DDS_FLAGS_FORCE_DX10_EXT, output_path.c_str());
+        DirectX::DDS_FLAGS_FORCE_DX10_EXT_MISC2, output_path.c_str());
 
     if (FAILED(save_hr))
     {
