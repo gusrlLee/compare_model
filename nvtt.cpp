@@ -4,12 +4,16 @@
 // The installed SDK is 3.2.5; unsupported signed BC4/BC5 are rejected explicitly.
 
 #include <nvtt/nvtt.h>
+#include <cuda.h>
+#include "nvtt_gpu.h"
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <locale>
 #include <iostream>
 #include <limits>
 #include <vector>
@@ -126,8 +130,50 @@ struct MemoryOutput : nvtt::OutputHandler
 
 // source retains the original blocks while image is progressively downsampled.
 // Context is borrowed from main and reused across files; Surface/output live per file.
+struct BatchTimes
+{
+    double decompress = 0;
+    double downsample = 0;
+    double compress = 0;
+    double pipeline = 0;
+};
+
+void WriteCsvRow(std::ostream& csv, const std::string& name, const BatchTimes& times, bool combined)
+{
+    csv << '"';
+    for (char c : name)
+    {
+        if (c == '"')
+            csv << '"';
+        csv << c;
+    }
+    csv << "\"," << times.decompress << ',';
+    if (combined)
+        csv << times.pipeline << ',' << times.decompress + times.pipeline << '\n';
+    else
+        csv << times.downsample << ',' << times.compress << ','
+            << times.decompress + times.downsample + times.compress << '\n';
+}
+
+bool OpenCsv(std::ofstream& csv, const std::filesystem::path& path, bool combined)
+{
+    csv.open(path);
+    csv.imbue(std::locale::classic());
+    csv << std::fixed << std::setprecision(6);
+    csv << (combined
+        ? "file name,decompression time,downsampling + compression time,total generation time\n"
+        : "file name,decompression time,downsampling time,compression time,total generation time\n");
+    if (!csv)
+    {
+        std::cerr << "Cannot create CSV: " << path << '\n';
+        return false;
+    }
+
+    return true;
+}
+
 int ProcessFile(const std::filesystem::path &input, const std::filesystem::path &output,
-                nvtt::Context &context, nvtt::Quality quality)
+                nvtt::Context &context, nvtt::Quality quality, BatchTimes* total = nullptr, bool warmup = false)
 {
     DDSImage source;
     if (!ReadDDS(input, source))
@@ -142,12 +188,14 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
         return 1;
     }
 
-    // Decompress raw blocks after file I/O has finished. Processing stays on the CPU.
-    // The Format overload interprets the supplied pointer as compressed BC blocks.
-    // Surface stores decoded pixels internally and releases them automatically.
+    // Keep both paths: NVTT CPU decoding, or CUDA texture hardware decoding.
+    // GPU decode uploads compressed blocks and leaves float pixels resident on the GPU.
+    const bool gpu = context.isCudaAccelerationEnabled();
     nvtt::Surface image;
     const auto decode_start = GetTime();
-    const bool decoded = image.setImage2D(source.format, source.width, source.height, source.blocks.data());
+    const bool decoded = gpu
+        ? DecompressGpu(source.format, source.width, source.height, source.blocks.data(), image)
+        : image.setImage2D(source.format, source.width, source.height, source.blocks.data());
     const double decode_ms = (GetTime() - decode_start) / 1000.0;
     if (!decoded)
     {
@@ -191,15 +239,28 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
     if (!memory.writeData(source.blocks.data(), static_cast<int>(source.blocks.size())))
         return 1;
 
+    // Decoded pixels are already GPU-resident. Measure filtering, encoding and completion.
+    // Per-mip synchronization would prevent the library from overlapping GPU work.
+    const auto pipeline_start = GetTime();
+
     // Mip 0 is already in memory as its exact original blocks, so begin at level 1.
     // Each buildNextMipmap replaces the current Surface with its next smaller image.
     // This avoids keeping an entire decoded chain resident at once.
     double mip_ms = 0, encode_ms = 0;
+    if (source.srgb && levels > 1)
+    {
+        const auto start = GetTime();
+        image.toLinearFromSrgb();
+        mip_ms += (GetTime() - start) / 1000.0;
+    }
     for (int mip = 1; mip < levels; ++mip)
     {
-        // Box filtering of stored channel values, matching the raw-filter baseline.
+        // Keep the working mip linear; only the encoder input returns to sRGB.
         const auto mip_start = GetTime();
         const bool downsampled = image.buildNextMipmap(nvtt::MipmapFilter_Box);
+        nvtt::Surface encodeImage = source.srgb ? image.clone() : image;
+        if (source.srgb)
+            encodeImage.toSrgb();
         mip_ms += (GetTime() - mip_start) / 1000.0;
         if (!downsampled)
         {
@@ -209,7 +270,7 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
         const auto encode_start = GetTime();
         // Face 0 is the single 2D image; mip identifies this level in the output stream.
         // Compression includes the callback copies and any library-internal transfers.
-        const bool compressed = context.compress(image, 0, mip, compression, options);
+        const bool compressed = context.compress(encodeImage, 0, mip, compression, options);
         encode_ms += (GetTime() - encode_start) / 1000.0;
         if (!compressed)
         {
@@ -217,6 +278,23 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
             return 1;
         }
     }
+
+    if (gpu && levels > 1)
+    {
+        // Wait without downloading the final uncompressed mip just for timing.
+        // The NVTT operations above leave their CUDA context current on this thread.
+        const CUresult status = cuCtxSynchronize();
+        if (status != CUDA_SUCCESS)
+        {
+            std::cerr << "CUDA completion failed: " << static_cast<int>(status) << '\n';
+            return 1;
+        }
+    }
+    const double pipeline_ms = levels > 1 ? (GetTime() - pipeline_start) / 1000.0 : 0;
+
+    // Warm-up completes the same processing path without saving or reporting.
+    if (warmup)
+        return 0;
 
     // Write the completed NVTT output only after all timed calls have finished.
     std::ofstream file(output, std::ios::binary);
@@ -227,17 +305,13 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
         std::cerr << "DDS save failed: " << output << '\n';
         return 1;
     }
-    // CUDA-enabled describes the Context setting, not proof of GPU execution for
-    // every format or quality. NVTT may choose a CPU encoder internally.
-    const char* quality_names[] = {"fastest", "normal", "production", "highest"};
-    std::cout << "Compression backend: NVTT "
-              << (context.isCudaAccelerationEnabled() ? "CUDA enabled (library fallback possible)" : "CPU") << '\n'
-              << "Quality: " << quality_names[quality] << '\n'
-              << "Mip levels: " << levels << '\n'
-              << "Decompress: " << decode_ms << " ms\n"
-              << "Downsampling: " << mip_ms << " ms\n"
-              << "Compression: " << encode_ms << " ms\n"
-              << "Total generation time: " << decode_ms + mip_ms + encode_ms << " ms\n";
+    if (total)
+    {
+        total->decompress = decode_ms;
+        total->downsample = mip_ms;
+        total->compress = encode_ms;
+        total->pipeline = pipeline_ms;
+    }
     return 0;
 }
 
@@ -294,15 +368,50 @@ int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::pat
         std::cerr << "Cannot create output folder: " << error.message() << '\n';
         return 1;
     }
+    std::ofstream csv;
+    if (!OpenCsv(csv, output / "timings.csv", context.isCudaAccelerationEnabled()))
+        return 1;
+
+    BatchTimes total;
     size_t succeeded = 0;
+    bool warmed_up = false;
     for (const auto &file : files)
     {
         std::cout << "Processing: " << file << '\n';
         const auto destination = output / file.filename();
-        if (CanWrite(destination) && ProcessFile(file, destination, context, quality) == 0)
+        if (!CanWrite(destination))
+            continue;
+        if (!warmed_up)
+        {
+            if (ProcessFile(file, destination, context, quality, nullptr, true) != 0)
+                continue;
+            warmed_up = true;
+            std::cout << "Warm-up completed (excluded from averages).\n";
+        }
+        BatchTimes times;
+        if (ProcessFile(file, destination, context, quality, &times) == 0)
+        {
+            WriteCsvRow(csv, file.filename().u8string(), times, context.isCudaAccelerationEnabled());
+            total.decompress += times.decompress;
+            total.downsample += times.downsample;
+            total.compress += times.compress;
+            total.pipeline += times.pipeline;
             ++succeeded;
+        }
     }
     std::cout << "Succeeded: " << succeeded << ", failed: " << files.size() - succeeded << '\n';
+    if (succeeded > 0)
+    {
+        WriteCsvRow(csv, "average", {total.decompress / succeeded, total.downsample / succeeded, total.compress / succeeded, total.pipeline / succeeded}, context.isCudaAccelerationEnabled());
+    }
+    else
+        std::cout << "Average times unavailable: no images succeeded.\n";
+    csv.close();
+    if (!csv)
+    {
+        std::cerr << "CSV write failed.\n";
+        return 1;
+    }
     return succeeded == files.size() ? 0 : 1;
 }
 
@@ -338,6 +447,16 @@ int main(int argc, char** argv)
         std::cerr << "CUDA acceleration is unavailable.\n";
         return 1;
     }
+    if (gpu)
+    {
+        // Resolve the delayed driver import and initialize it outside image timers.
+        const CUresult status = cuInit(0);
+        if (status != CUDA_SUCCESS)
+        {
+            std::cerr << "CUDA driver initialization failed: " << static_cast<int>(status) << '\n';
+            return 1;
+        }
+    }
     const std::filesystem::path input(argv[1]), output(argv[2]);
     if (input.filename() == "*.dds")
         return ProcessBatch(input.has_parent_path() ? input.parent_path() : ".", output, context, quality);
@@ -352,5 +471,31 @@ int main(int argc, char** argv)
     }
     if (directory)
         return ProcessBatch(input, output, context, quality);
-    return CanWrite(output) ? ProcessFile(input, output, context, quality) : 1;
+    if (!CanWrite(output))
+        return 1;
+    if (ProcessFile(input, output, context, quality, nullptr, true) != 0)
+        return 1;
+    std::cout << "Warm-up completed (excluded from averages).\n";
+    std::ofstream csv;
+    auto csv_path = output;
+    csv_path.replace_extension(".timings.csv");
+    if (!OpenCsv(csv, csv_path, context.isCudaAccelerationEnabled()))
+        return 1;
+    
+    BatchTimes times;
+    const int result = ProcessFile(input, output, context, quality, &times);
+    if (result == 0)
+    {
+        WriteCsvRow(csv, input.filename().u8string(), times, context.isCudaAccelerationEnabled());
+        WriteCsvRow(csv, "average", times, context.isCudaAccelerationEnabled());
+    }
+    
+    csv.close();
+    if (!csv)
+    {
+        std::cerr << "CSV write failed.\n";
+        return 1;
+    }
+    
+    return result;
 }

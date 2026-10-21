@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <vector>
 #include <fstream>
+#include <iomanip>
+#include <locale>
 #include <stdexcept>
 #include <assert.h>
 
@@ -64,8 +66,20 @@ struct DdsBenchmarkResult
 };
 
 
+static void WriteCsvRow(std::ostream& csv, const std::string& name,
+    double decompress, double pipeline)
+{
+    csv << '"';
+    for (char c : name)
+    {
+        if (c == '"') csv << '"';
+        csv << c;
+    }
+    csv << "\"," << decompress << ',' << pipeline << ',' << decompress + pipeline << '\n';
+}
+
 static bool ProcessDdsFile(const fs::path& input, const fs::path& output, DdsBenchmarkResult& result,
-    unsigned int workers, CodecType codec, bool linearize )
+    unsigned int workers, CodecType codec, bool linearize, bool warmup = false )
 {
     // Step 1: Load the file. Do not time file reading.
     auto ddsData = LoadFileToMemory( input );
@@ -117,7 +131,8 @@ static bool ProcessDdsFile(const fs::path& input, const fs::path& output, DdsBen
         }
 
         // Give the image to the old pipeline. dp now owns its memory.
-        DataProvider dp( std::move( decoded ), true, linearize );
+        const bool useSrgbFiltering = linearize && codec != CodecType::Bc4 && codec != CodecType::Bc5;
+        DataProvider dp( std::move( decoded ), true, useSrgbFiltering );
         const auto num = dp.NumberOfParts();
         size_t offset = 0;
 
@@ -158,12 +173,12 @@ static bool ProcessDdsFile(const fs::path& input, const fs::path& output, DdsBen
         dp.WaitForBenchmark();
         result.mipmapCompression = GetTime() - processingStart;
 
+        // All asynchronous work has completed before the warm-up result is discarded.
+        if( warmup ) return true;
+
         // Step 4: Save the result after timing has stopped.
         if( !compressed->WriteForBenchmark( output.string().c_str(), BlockData::Dds, source ) ) return false;
-        printf( "%s (%d x %d): decompress %.3f ms, mipmap + compression %.3f ms\n",
-            input.string().c_str(), size.x, size.y,
-            result.decompress / 1000.0, result.mipmapCompression / 1000.0 );
-        printf( "Saved: %s\n", output.string().c_str() );
+
     }
     catch( const std::invalid_argument& error )
     {
@@ -214,7 +229,18 @@ static bool RunDdsMipmapBenchmark(
     TaskDispatch taskDispatch( cpus );
 
     // Use the same thread pool for the whole batch.
+    std::ofstream csv(outputDir / "timings.csv");
+    csv.imbue(std::locale::classic());
+    csv << std::fixed << std::setprecision(6)
+        << "file name,decompression time,downsampling + compression time,total generation time\n";
+    if (!csv)
+    {
+        fprintf(stderr, "Cannot create CSV.\n");
+        return false;
+    }
     DdsBenchmarkResult total;
+    size_t succeeded = 0;
+    bool warmedUp = false;
 
     if( codec == CodecType::Bc7 )
     {
@@ -223,6 +249,7 @@ static bool RunDdsMipmapBenchmark(
 
     for( const auto& file : files )
     {
+        printf("Processing: %s\n", file.string().c_str());
         DdsBenchmarkResult result;
 
         auto filename = file.filename();
@@ -232,22 +259,48 @@ static bool RunDdsMipmapBenchmark(
         if( fs::exists( output ) && fs::equivalent( file, output ) )
         {
             fprintf( stderr, "Output must differ from input: %s\n", file.string().c_str() );
-            return false;
+            continue;
+        }
+        if( !warmedUp )
+        {
+            DdsBenchmarkResult warmupResult;
+            if( !ProcessDdsFile( file, output, warmupResult, cpus, codec, linearize, true ) )
+                continue;
+            warmedUp = true;
+            printf( "Warm-up completed (excluded from averages).\n" );
         }
         if( !ProcessDdsFile( file, output, result, cpus, codec, linearize ) )
         {
-            return false;
+            continue;
         }
 
+        const auto utf8Name = file.filename().u8string();
+        WriteCsvRow(csv, std::string(utf8Name.begin(), utf8Name.end()),
+            result.decompress / 1000.0, result.mipmapCompression / 1000.0);
+
         // Add this file's times to the batch totals.
+        ++succeeded;
         total.decompress += result.decompress;
         total.mipmapCompression += result.mipmapCompression;
     }
 
-    printf( "Total decompress time: %.3f ms\n", total.decompress / 1000.0 );
-    printf( "Total mipmap + compression time: %.3f ms\n", total.mipmapCompression / 1000.0 );
-
-    return true;
+    printf( "Succeeded: %zu, failed: %zu\n", succeeded, files.size() - succeeded );
+    if( succeeded > 0 )
+    {
+        WriteCsvRow(csv, "average", total.decompress / (1000.0 * succeeded),
+            total.mipmapCompression / (1000.0 * succeeded));
+    }
+    else
+    {
+        printf( "Average times unavailable: no images succeeded.\n" );
+    }
+    csv.close();
+    if (!csv)
+    {
+        fprintf(stderr, "CSV write failed.\n");
+        return false;
+    }
+    return succeeded == files.size();
 }
 
 // Only the DDS mipmap experiment remains; no separate mode flag is needed.

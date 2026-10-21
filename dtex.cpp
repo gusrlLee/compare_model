@@ -13,6 +13,9 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <fstream>
+#include <iomanip>
+#include <locale>
 #include <objbase.h>
 
 #include "common/timer.h"
@@ -27,8 +30,41 @@ char Lowercase(unsigned char c)
 // A null device selects CPU compression; a valid device selects GPU compression.
 // ScratchImage objects own their pixel buffers and release them on every return path.
 // The device is borrowed from main and must remain alive for the whole call.
+struct BatchTimes
+{
+    double decompress = 0;
+    double downsample = 0;
+    double compress = 0;
+};
+
+void WriteCsvRow(std::ostream& csv, const std::string& name, const BatchTimes& times)
+{
+    csv << '"';
+    for (char c : name)
+    {
+        if (c == '"')
+            csv << '"';
+        csv << c;
+    }
+    csv << "\"," << times.decompress << ',' << times.downsample << ',' << times.compress << ',' << times.decompress + times.downsample + times.compress << '\n';
+}
+
+bool OpenCsv(std::ofstream& csv, const std::filesystem::path& path)
+{
+    csv.open(path);
+    csv.imbue(std::locale::classic());
+    csv << std::fixed << std::setprecision(6) << "file name,decompression time,downsampling time,compression time,total generation time\n";
+    if (!csv)
+    {
+        std::cerr << "Cannot create CSV: " << path << '\n';
+        return false;
+    }
+
+    return true;
+}
+
 int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::path &output_path,
-                ID3D11Device* device)
+                ID3D11Device* device, BatchTimes* total = nullptr, bool warmup = false)
 {
     // 1. Load and validate the input. File I/O is outside all processing timers.
     // source owns the compressed pixels; metadata describes their layout.
@@ -79,6 +115,7 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
     // 2. Decompress on the CPU, including when GPU compression is selected.
     // UNKNOWN lets DirectXTex choose the decoded format, including HDR for BC6H.
     DirectX::ScratchImage decompressed;
+
     const auto decompress_start = GetTime();
     const HRESULT decompress_hr = DirectX::Decompress(
         source.GetImages(), source.GetImageCount(), source.GetMetadata(),
@@ -96,10 +133,12 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
     // Color-space handling is left to DirectXTex's flags and decoded format.
     DirectX::ScratchImage mip_chain;
     const auto downsample_start = GetTime();
+    
     const HRESULT mip_hr = DirectX::GenerateMipMaps(
         decompressed.GetImages(), decompressed.GetImageCount(),
         decompressed.GetMetadata(),
         DirectX::TEX_FILTER_BOX, 0, mip_chain);
+
     const double downsample_ms = (GetTime() - downsample_start) / 1000.0;
 
     if (FAILED(mip_hr))
@@ -122,6 +161,7 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
         const DirectX::Image *first_lower_mip = mip_chain.GetImages() + 1;
         lower_metadata.width = first_lower_mip->width;
         lower_metadata.height = first_lower_mip->height;
+    
         --lower_metadata.mipLevels;
 
         // Use the library's CPU parallel implementation instead of adding file workers.
@@ -154,6 +194,7 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
                 metadata.format, flags,
                 DirectX::TEX_THRESHOLD_DEFAULT, compressed);
         }
+    
         compress_ms = (GetTime() - compress_start) / 1000.0;
         if (FAILED(compress_hr))
         {
@@ -168,12 +209,14 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
     std::vector<DirectX::Image> images{source.GetImages()[0]};
     if (compressed.GetImageCount() > 0)
     {
-        images.insert(images.end(), compressed.GetImages(),
-                      compressed.GetImages() + compressed.GetImageCount());
+        images.insert(images.end(), compressed.GetImages(), compressed.GetImages() + compressed.GetImageCount());
     }
 
     auto output_metadata = metadata;
     output_metadata.mipLevels = images.size();
+
+    if (warmup)
+        return 0;
 
     const HRESULT save_hr = DirectX::SaveToDDSFile(
         images.data(), images.size(), output_metadata,
@@ -185,14 +228,12 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
         return 1;
     }
 
-    // 6. Report the sum of the three processing calls, not total program runtime.
-    // GetTime returns microseconds, so divide each elapsed time by 1000 for ms.
-    std::cout << "Mip levels: " << mip_chain.GetMetadata().mipLevels << '\n'
-              << "Compression backend: " << (device ? "GPU" : "CPU OpenMP") << '\n'
-              << "Decompress: " << decompress_ms << " ms\n"
-              << "Downsampling: " << downsample_ms << " ms\n"
-              << "Compression: " << compress_ms << " ms\n"
-              << "Total generation time : " << decompress_ms + downsample_ms + compress_ms << " ms" << '\n';
+    if (total)
+    {
+        total->decompress = decompress_ms;
+        total->downsample = downsample_ms;
+        total->compress = compress_ms;
+    }
     return 0;
 }
 
@@ -200,34 +241,39 @@ int ProcessFile(const std::filesystem::path &input_path, const std::filesystem::
 // Sort before processing to make the input order repeatable between runs.
 // Files are processed one at a time; codec-internal threads may still run in parallel.
 // Continue after a file fails, then return failure if any file was skipped or failed.
-int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::path &output,
-                 ID3D11Device* device)
+int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::path &output, ID3D11Device* device)
 {
     // Collect first, then process. Keep directory traversal out of the image pipeline.
     std::error_code error;
     std::vector<std::filesystem::path> files;
     std::filesystem::directory_iterator entry(folder, error), end;
+
     for (; !error && entry != end; entry.increment(error))
     {
         const bool regular_file = entry->is_regular_file(error);
         if (error)
             break;
-        // Match .dds regardless of letter case.
+        
+            // Match .dds regardless of letter case.
         auto extension = entry->path().extension().string();
         std::transform(extension.begin(), extension.end(), extension.begin(), Lowercase);
+
         if (regular_file && extension == ".dds")
             files.push_back(entry->path());
     }
+
     if (error)
     {
         std::cerr << "Cannot read folder " << folder << ": " << error.message() << '\n';
         return 1;
     }
+
     if (files.empty())
     {
         std::cerr << "No DDS files found.\n";
         return 1;
     }
+
     std::sort(files.begin(), files.end());
 
     std::filesystem::create_directories(output, error);
@@ -237,7 +283,15 @@ int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::pat
         return 1;
     }
 
+    std::ofstream csv;
+    if (!OpenCsv(csv, output / "timings.csv"))
+        return 1;
+
+    BatchTimes total;
     size_t succeeded = 0;
+    bool warmed_up = false;
+    
+    // main processing loop 
     for (const auto &file : files)
     {
         const auto destination = output / file.filename();
@@ -254,13 +308,39 @@ int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::pat
             std::cerr << "Output already exists: " << destination << '\n';
             continue;
         }
-        if (ProcessFile(file, destination, device) == 0)
+        if (!warmed_up)
+        {
+            if (ProcessFile(file, destination, device, nullptr, true) != 0)
+                continue;
+            warmed_up = true;
+            std::cout << "Warm-up completed (excluded from averages).\n";
+        }
+        BatchTimes times;
+        if (ProcessFile(file, destination, device, &times) == 0)
+        {
+            WriteCsvRow(csv, file.filename().u8string(), times);
+            total.decompress += times.decompress;
+            total.downsample += times.downsample;
+            total.compress += times.compress;
             ++succeeded;
+        }
     }
 
-    std::cout << std::dec << "Succeeded: " << succeeded
-              << ", failed: " << files.size() - succeeded << '\n';
+    std::cout << std::dec << "Succeeded: " << succeeded << ", failed: " << files.size() - succeeded << '\n';
+
     // Skipped files also count as failures in the batch exit status.
+    if (succeeded > 0)
+    {
+        WriteCsvRow(csv, "average", {total.decompress / succeeded, total.downsample / succeeded, total.compress / succeeded});
+    }
+    else
+        std::cout << "Average times unavailable: no images succeeded.\n";
+    csv.close();
+    if (!csv)
+    {
+        std::cerr << "CSV write failed.\n";
+        return 1;
+    }
     return succeeded == files.size() ? 0 : 1;
 }
 
@@ -280,8 +360,7 @@ int main(int argc, char **argv)
     const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(com_hr))
     {
-        std::cerr << "COM initialization failed: 0x" << std::hex
-                  << static_cast<unsigned long>(com_hr) << '\n';
+        std::cerr << "COM initialization failed: 0x" << std::hex << static_cast<unsigned long>(com_hr) << '\n';
         return 1;
     }
 
@@ -294,6 +373,7 @@ int main(int argc, char **argv)
     // 2. Create a shared GPU device only when --gpu is requested.
     // Device creation happens outside the measured calls.
     // ComPtr releases the device automatically when main returns.
+    // if we use GPU encoder, 
     Microsoft::WRL::ComPtr<ID3D11Device> device;
     if (argc == 4)
     {
@@ -301,6 +381,7 @@ int main(int argc, char **argv)
         const HRESULT device_hr = D3D11CreateDevice(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
             levels, 1, D3D11_SDK_VERSION, device.GetAddressOf(), nullptr, nullptr);
+        
         if (FAILED(device_hr))
         {
             std::cerr << "GPU device creation failed: 0x" << std::hex
@@ -310,8 +391,10 @@ int main(int argc, char **argv)
     }
 
     // 3. Route a wildcard or folder to batch mode; otherwise process one file.
+    // Input and output path define 
     const std::filesystem::path input(argv[1]);
     const std::filesystem::path output(argv[2]);
+
     // Handle the supported wildcard explicitly; no general glob matching is used.
     if (input.filename() == "*.dds")
     {
@@ -333,5 +416,30 @@ int main(int argc, char **argv)
     if (directory)
         return ProcessBatch(input, output, device.Get());
 
-    return ProcessFile(input, output, device.Get());
+    if (ProcessFile(input, output, device.Get(), nullptr, true) != 0)
+        return 1;
+    
+    std::cout << "Warm-up completed (excluded from averages).\n";
+    std::ofstream csv;
+    auto csv_path = output;
+    csv_path.replace_extension(".timings.csv");
+    if (!OpenCsv(csv, csv_path))
+        return 1;
+    
+    BatchTimes times;
+    const int result = ProcessFile(input, output, device.Get(), &times);
+    if (result == 0)
+    {
+        WriteCsvRow(csv, input.filename().u8string(), times);
+        WriteCsvRow(csv, "average", times);
+    }
+    
+    csv.close();
+    if (!csv)
+    {
+        std::cerr << "CSV write failed.\n";
+        return 1;
+    }
+    
+    return result;
 }

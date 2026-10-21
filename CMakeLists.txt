@@ -91,9 +91,30 @@ set_target_properties(NVTT::NVTT PROPERTIES
     IMPORTED_IMPLIB "${NVTT_LIBRARY}"
     IMPORTED_LOCATION "${NVTT_DLL}"
     INTERFACE_INCLUDE_DIRECTORIES "${NVTT_INCLUDE_DIR}")
-add_executable(nvtt nvtt.cpp)
+enable_language(CUDA)
+add_executable(nvtt nvtt.cpp nvtt_gpu.cu)
+set_target_properties(nvtt PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
 target_compile_features(nvtt PRIVATE cxx_std_17)
-target_link_libraries(nvtt PRIVATE NVTT::NVTT)
+find_package(CUDAToolkit REQUIRED)
+target_link_libraries(nvtt PRIVATE NVTT::NVTT CUDA::cuda_driver)
+if(MSVC)
+    # Load the NVIDIA driver only when --gpu actually calls the synchronization API.
+    target_link_libraries(nvtt PRIVATE delayimp)
+    target_link_options(nvtt PRIVATE /DELAYLOAD:nvcuda.dll)
+    target_compile_options(nvtt PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+endif()
+file(GLOB NVTT_CUDART_DLL "${CUDAToolkit_BIN_DIR}/cudart64_*.dll")
 add_custom_command(TARGET nvtt POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:NVTT::NVTT>" "$<TARGET_FILE_DIR:nvtt>")
+        "$<TARGET_FILE:NVTT::NVTT>" ${NVTT_CUDART_DLL} "$<TARGET_FILE_DIR:nvtt>")
+
+# Explicit validation target; not part of a normal benchmark build.
+add_executable(nvtt_decode_check EXCLUDE_FROM_ALL tests/nvtt_decode_check.cpp nvtt_gpu.cu)
+add_dependencies(nvtt_decode_check nvtt)
+set_target_properties(nvtt_decode_check PROPERTIES
+    CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_RUNTIME_LIBRARY Shared)
+target_compile_features(nvtt_decode_check PRIVATE cxx_std_17)
+target_link_libraries(nvtt_decode_check PRIVATE NVTT::NVTT)
+if(MSVC)
+    target_compile_options(nvtt_decode_check PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+endif()

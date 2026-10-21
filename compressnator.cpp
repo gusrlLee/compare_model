@@ -13,6 +13,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <locale>
 #include <iostream>
 #include <limits>
 #include <vector>
@@ -129,16 +131,16 @@ bool CheckStatus(CMP_ERROR status, const char* stage)
 }
 
 // Allocate the decoded destination before starting the conversion timer.
-// Float channels keep HDR range and signed BC4/BC5 values that RGBA8 would discard.
+// Float channels retain HDR/signed values and precision for linear-light sRGB filtering.
 // gpu selects the intermediate representation required by DXC, not GPU decoding.
 bool Decompress(CMP_MipSet &source, CMP_MipSet &decoded,
-                CMP_CompressOptions &options, bool gpu, double &milliseconds)
+                CMP_CompressOptions &options, bool gpu, bool srgb, double &milliseconds)
 {
     const auto codec = source.m_format;
     const bool hdr = codec == CMP_FORMAT_BC6H || codec == CMP_FORMAT_BC6H_SF;
     const bool signed_channels = codec == CMP_FORMAT_BC4_S || codec == CMP_FORMAT_BC5_S;
     // The DXC pipeline expects half-float HDR pixels; keep the CPU baseline unchanged.
-    const auto channels = hdr && gpu ? CF_Float16 : hdr || signed_channels ? CF_Float32 : CF_8bit;
+    const auto channels = hdr && gpu ? CF_Float16 : hdr || signed_channels || srgb ? CF_Float32 : CF_8bit;
     const auto format = channels == CF_Float16 ? CMP_FORMAT_RGBA_16F
         : channels == CF_Float32 ? CMP_FORMAT_RGBA_32F : CMP_FORMAT_RGBA_8888;
     if (!CheckStatus(CMP_CreateMipSet(&decoded, source.m_nWidth, source.m_nHeight,
@@ -240,10 +242,10 @@ bool PadGpuInput(CMP_MipSet &decoded, int mip, CMP_MipSet &padded)
 // Setup API calls below are outside the timer; work deferred by the SDK into
 // CMP_CompressTexture is inside it. This is API wall time, not GPU kernel-only time.
 bool CompressGpuMip(CMP_MipSet &decoded, CMP_MipSet &result, int mip,
-                    CMP_CompressOptions &options, double &milliseconds)
+                    int inputMip, CMP_CompressOptions &options, double &milliseconds)
 {
     OwnedMipSet padded;
-    if (!PadGpuInput(decoded, mip, padded.data))
+    if (!PadGpuInput(decoded, inputMip, padded.data))
         return false;
 
     KernelOptions kernel{};
@@ -280,20 +282,59 @@ bool CompressGpuMip(CMP_MipSet &decoded, CMP_MipSet &result, int mip,
 // Start at mip 1: mip 0 already contains the unchanged source blocks.
 // Accumulate one call per mip. A 1x1 source has no lower mip and takes zero encode time.
 bool CompressMips(CMP_MipSet &decoded, CMP_MipSet &result,
-                  CMP_CompressOptions &options, bool gpu, double &milliseconds)
+                  CMP_CompressOptions &options, bool gpu, bool srgb,
+                  double &milliseconds, double &mip_ms)
 {
     for (int mip = 1; mip < result.m_nMipLevels; ++mip)
     {
+        OwnedMipSet encoderInput;
+        auto* inputSet = &decoded;
+        int inputMip = mip;
+        if (srgb)
+        {
+            const auto start = GetTime();
+            const auto linear = GetTexture(decoded, mip);
+            // Supply whole blocks even for the final 2x2/1x1 mips; repeat edge pixels.
+            const auto width = std::max(4u, linear.dwWidth);
+            const auto height = std::max(4u, linear.dwHeight);
+            if (!CheckStatus(CMP_CreateMipSet(&encoderInput.data, width, height,
+                                             1, CF_8bit, TT_2D), "sRGB input allocation"))
+                return false;
+            encoderInput.data.m_format = CMP_FORMAT_RGBA_8888;
+            const auto output = GetTexture(encoderInput.data, 0);
+            const auto* pixels = reinterpret_cast<const float*>(linear.pData);
+            for (unsigned int y = 0; y < height; ++y)
+            for (unsigned int x = 0; x < width; ++x)
+            for (unsigned int c = 0; c < 4; ++c)
+            {
+                const size_t pixel = size_t(std::min(y, linear.dwHeight - 1)) * linear.dwWidth
+                    + std::min(x, linear.dwWidth - 1);
+                float value = pixels[pixel * 4 + c];
+                if (c != 3)
+                    value = value <= 0.0031308f ? 12.92f * value
+                        : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
+                output.pData[(size_t(y) * width + x) * 4 + c] =
+                    static_cast<CMP_BYTE>(std::clamp(value, 0.0f, 1.0f) * 255.0f + 0.5f);
+            }
+            mip_ms += (GetTime() - start) / 1000.0;
+            inputSet = &encoderInput.data;
+            inputMip = 0;
+        }
         if (gpu)
         {
-            if (!CompressGpuMip(decoded, result, mip, options, milliseconds))
+            if (!CompressGpuMip(*inputSet, result, mip, inputMip, options, milliseconds))
                 return false;
             continue;
         }
-        auto input = GetTexture(decoded, mip);
+        auto input = GetTexture(*inputSet, inputMip);
         auto output = GetTexture(result, mip);
         // shortcut: SDK 4.6.0 corrupts tiny BC1 mips with auto threads; retest after upgrading.
-        options.dwnumThreads = input.dwWidth < 4 || input.dwHeight < 4 ? 1 : 0;
+        options.dwnumThreads = output.dwWidth < 4 || output.dwHeight < 4 ? 1 : 0;
+        if (srgb)
+        {
+            output.dwWidth = input.dwWidth;
+            output.dwHeight = input.dwHeight;
+        }
         const auto start = GetTime();
         const auto status = CMP_ConvertTexture(&input, &output, &options, nullptr);
         milliseconds += (GetTime() - start) / 1000.0;
@@ -311,7 +352,6 @@ bool CompressMips(CMP_MipSet &decoded, CMP_MipSet &result,
             std::cerr << "Software rasterizers are excluded from the GPU benchmark.\n";
             return false;
         }
-        std::cout << "GPU device: " << device.m_deviceName << '\n';
     }
     return true;
 }
@@ -345,8 +385,41 @@ bool SaveDDS(const std::filesystem::path &output, CMP_MipSet &result, const DDSM
 
 // Keep source, decoded, and compressed storage independent so Mip 0 remains intact.
 // Stack owners release all three mip sets if any stage returns an error.
+struct BatchTimes
+{
+    double decompress = 0;
+    double downsample = 0;
+    double compress = 0;
+};
+
+void WriteCsvRow(std::ostream& csv, const std::string& name, const BatchTimes& times)
+{
+    csv << '"';
+    for (char c : name)
+    {
+        if (c == '"')
+            csv << '"';
+        csv << c;
+    }
+    csv << "\"," << times.decompress << ',' << times.downsample << ',' << times.compress << ',' << times.decompress + times.downsample + times.compress << '\n';
+}
+
+bool OpenCsv(std::ofstream& csv, const std::filesystem::path& path)
+{
+    csv.open(path);
+    csv.imbue(std::locale::classic());
+    csv << std::fixed << std::setprecision(6) << "file name,decompression time,downsampling time,compression time,total generation time\n";
+    if (!csv)
+    {
+        std::cerr << "Cannot create CSV: " << path << '\n';
+        return false;
+    }
+
+    return true;
+}
+
 int ProcessFile(const std::filesystem::path &input, const std::filesystem::path &output,
-                float quality, bool gpu)
+                float quality, bool gpu, BatchTimes* total = nullptr, bool warmup = false)
 {
     DDSMetadata metadata;
     OwnedMipSet source, decoded, result;
@@ -358,6 +431,8 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
     if (!CheckStatus(CMP_LoadTexture(input.string().c_str(), &source.data), "DDS load"))
         return 1;
     const auto codec = source.data.m_format;
+    const auto dxgi = metadata.extension[0];
+    const bool srgb = metadata.dx10 && (dxgi == 72 || dxgi == 75 || dxgi == 78 || dxgi == 99);
     if (!IsBC(codec) || source.data.m_nMipLevels != 1
         || source.data.m_TextureType != TT_2D || source.data.m_nDepth != 1)
     {
@@ -387,9 +462,21 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
     double decode_ms = 0, mip_ms = 0, encode_ms = 0;
 
     // Only these three processing steps contribute to the reported total.
-    if (!Decompress(source.data, decoded.data, options, gpu, decode_ms))
+    if (!Decompress(source.data, decoded.data, options, gpu, srgb, decode_ms))
         return 1;
     const auto start = GetTime();
+    if (srgb)
+    {
+        const auto base = GetTexture(decoded.data, 0);
+        auto* pixels = reinterpret_cast<float*>(base.pData);
+        for (size_t i = 0; i < size_t(base.dwWidth) * base.dwHeight * 4; ++i)
+        {
+            if (i % 4 == 3) continue;
+            const float value = pixels[i];
+            pixels[i] = value <= 0.04045f ? value / 12.92f
+                : std::pow((value + 0.055f) / 1.055f, 2.4f);
+        }
+    }
     const int mip_status = CMP_GenerateMIPLevels(&decoded.data, 1); // CPU Box, down to 1x1.
     mip_ms = (GetTime() - start) / 1000.0;
     if (mip_status != 0)
@@ -399,20 +486,23 @@ int ProcessFile(const std::filesystem::path &input, const std::filesystem::path 
     }
     if (!AllocateOutput(source.data, decoded.data, result.data, metadata.dx10))
         return 1;
-    if (!CompressMips(decoded.data, result.data, options, gpu, encode_ms))
+    if (!CompressMips(decoded.data, result.data, options, gpu, srgb, encode_ms, mip_ms))
         return 1;
+    // Warm-up completes the same processing path without saving or reporting.
+    if (warmup)
+        return 0;
+
     // Saving is deliberately left in its current disabled state for this comment pass.
     // The printed success count does not imply that an output file was written.
-    // if (!SaveDDS(output, result.data, metadata))
-    //     return 1;
+    if (!SaveDDS(output, result.data, metadata))
+        return 1;
 
-    std::cout << "Compression backend: " << (gpu ? "GPU DXC" : "CPU (auto threads; tiny mips: 1)") << '\n'
-              << "Quality: " << quality << '\n'
-              << "Mip levels: " << result.data.m_nMipLevels << '\n'
-              << "Decompress: " << decode_ms << " ms\n"
-              << "Downsampling: " << mip_ms << " ms\n"
-              << "Compression: " << encode_ms << " ms\n"
-              << "Total generation time: " << decode_ms + mip_ms + encode_ms << " ms\n";
+    if (total)
+    {
+        total->decompress = decode_ms;
+        total->downsample = mip_ms;
+        total->compress = encode_ms;
+    }
     return 0;
 }
 
@@ -460,7 +550,13 @@ int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::pat
         return 1;
     }
 
+    std::ofstream csv;
+    if (!OpenCsv(csv, output / "timings.csv"))
+        return 1;
+
+    BatchTimes total;
     size_t succeeded = 0;
+    bool warmed_up = false;
     for (const auto &file : files)
     {
         std::cout << "Processing: " << file << '\n';
@@ -471,10 +567,36 @@ int ProcessBatch(const std::filesystem::path &folder, const std::filesystem::pat
             std::cerr << "Cannot write output: " << destination << '\n';
             continue;
         }
-        if (ProcessFile(file, destination, quality, gpu) == 0)
+        if (!warmed_up)
+        {
+            if (ProcessFile(file, destination, quality, gpu, nullptr, true) != 0)
+                continue;
+            warmed_up = true;
+            std::cout << "Warm-up completed (excluded from averages).\n";
+        }
+        BatchTimes times;
+        if (ProcessFile(file, destination, quality, gpu, &times) == 0)
+        {
+            WriteCsvRow(csv, file.filename().u8string(), times);
+            total.decompress += times.decompress;
+            total.downsample += times.downsample;
+            total.compress += times.compress;
             ++succeeded;
+        }
     }
     std::cout << "Succeeded: " << succeeded << ", failed: " << files.size() - succeeded << '\n';
+    if (succeeded > 0)
+    {
+        WriteCsvRow(csv, "average", {total.decompress / succeeded, total.downsample / succeeded, total.compress / succeeded});
+    }
+    else
+        std::cout << "Average times unavailable: no images succeeded.\n";
+    csv.close();
+    if (!csv)
+    {
+        std::cerr << "CSV write failed.\n";
+        return 1;
+    }
     return succeeded == files.size() ? 0 : 1;
 }
 
@@ -537,5 +659,29 @@ int main(int argc, char** argv)
         return 1;
     }
     
-    return ProcessFile(input, output, quality, gpu);
+    if (ProcessFile(input, output, quality, gpu, nullptr, true) != 0)
+        return 1;
+    std::cout << "Warm-up completed (excluded from averages).\n";
+    std::ofstream csv;
+    auto csv_path = output;
+    csv_path.replace_extension(".timings.csv");
+    if (!OpenCsv(csv, csv_path))
+        return 1;
+    
+    BatchTimes times;
+    const int result = ProcessFile(input, output, quality, gpu, &times);
+    if (result == 0)
+    {
+        WriteCsvRow(csv, input.filename().u8string(), times);
+        WriteCsvRow(csv, "average", times);
+    }
+    
+    csv.close();
+    if (!csv)
+    {
+        std::cerr << "CSV write failed.\n";
+        return 1;
+    }
+    
+    return result;
 }
